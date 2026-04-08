@@ -17,7 +17,7 @@ dependencies = [
     "torch==2.7.1",
     "torchaudio==2.7.1",
     # transformers 5.x rewrote masking/cache internals in a way that breaks CUDA graph capture
-    "transformers==4.46.3",
+    "transformers==5.0.0rc3",
     "diffusers==0.29.0",
     "resemble-perth @ git+https://github.com/resemble-ai/Perth.git@master",
     "conformer==0.3.2",
