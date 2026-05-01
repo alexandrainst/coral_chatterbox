@@ -207,15 +207,17 @@ def build_app(config: ServerConfig) -> FastAPI:
         kwargs: dict[str, Any] = {}
         if body.exaggeration is not None:
             kwargs["exaggeration"] = body.exaggeration
-        # Hold the model lock: prepare_conditionals mutates inference.model.conds.
-        async with app.state.lock:
-            try:
-                voice = app.state.registry.register_from_base64(body.name, body.audio_b64, **kwargs)
-            except VoiceError as exc:
-                raise HTTPException(status_code=400, detail=str(exc)) from exc
-            except Exception as exc:
-                logger.exception("register_from_base64 failed for '%s'", body.name)
-                raise HTTPException(status_code=400, detail="could not decode reference audio") from exc
+        try:
+            voice = app.state.registry.register_from_base64(
+                body.name, body.audio_b64,
+                persist_dir=config.voices_dir,
+                **kwargs,
+            )
+        except VoiceError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except Exception as exc:
+            logger.exception("register_from_base64 failed for '%s'", body.name)
+            raise HTTPException(status_code=400, detail="could not decode reference audio") from exc
         return {"id": voice.name, "expires_at": None}
 
     @app.post("/v1/audio/speech")
@@ -235,10 +237,8 @@ def build_app(config: ServerConfig) -> FastAPI:
         inference: ChatterboxInference = app.state.inference
         registry: VoiceRegistry = app.state.registry
 
-        # Resolve named voices outside the lock (read-only registry lookup).
-        # Inline base64 voices are computed under the lock since they mutate
-        # inference.model.conds via prepare_conditionals.
-        named_voice = None
+        # Resolve the voice reference (registry lookup or inline b64 check).
+        voice = None
         if not req.audio_prompt_b64:
             name = req.voice or app.state.default_voice
             if name is None:
@@ -246,16 +246,13 @@ def build_app(config: ServerConfig) -> FastAPI:
                     status_code=400,
                     detail="no voice specified and no default voice configured",
                 )
-            named_voice = registry.get(name)
-            if named_voice is None:
+            voice = registry.get(name)
+            if voice is None:
                 raise HTTPException(status_code=404, detail=f"unknown voice '{name}'")
 
         language = req.language or config.default_language
         gen_kwargs = _generation_kwargs(req)
 
-        # Wrapper-level kwargs accepted by ChatterboxInference.generate /
-        # generate_fast / streaming variants. ``sentence_split`` is dropped on
-        # the streaming path (always split there).
         wrapper_kwargs: dict[str, Any] = {"language_id": language}
         if req.normalize_text is not None:
             wrapper_kwargs["normalize_text"] = req.normalize_text
@@ -266,27 +263,28 @@ def build_app(config: ServerConfig) -> FastAPI:
         streaming = req.stream_format == "audio"
         use_fast = config.fast and hasattr(inference.model, "generate_fast")
 
-        def _resolve_voice_under_lock():
-            if named_voice is not None:
-                return named_voice
-            transient_kwargs: dict[str, Any] = {}
+        def _prepare_voice():
+            """Run prepare_conditionals for the resolved voice. Must be called under lock."""
+            cond_kwargs: dict[str, Any] = {}
             if req.exaggeration is not None:
-                transient_kwargs["exaggeration"] = req.exaggeration
-            try:
-                return registry.register_transient(req.audio_prompt_b64, **transient_kwargs)
-            except VoiceError as exc:
-                raise HTTPException(status_code=400, detail=str(exc)) from exc
-            except Exception as exc:
-                logger.exception("register_transient failed for inline audio_prompt_b64")
-                raise HTTPException(
-                    status_code=400, detail="could not decode reference audio",
-                ) from exc
+                cond_kwargs["exaggeration"] = req.exaggeration
+            if voice is not None:
+                registry.apply(voice, **cond_kwargs)
+            else:
+                try:
+                    registry.apply_b64(req.audio_prompt_b64, **cond_kwargs)
+                except VoiceError as exc:
+                    raise HTTPException(status_code=400, detail=str(exc)) from exc
+                except Exception as exc:
+                    logger.exception("apply_b64 failed for inline audio_prompt_b64")
+                    raise HTTPException(
+                        status_code=400, detail="could not decode reference audio",
+                    ) from exc
 
         if streaming:
             async def body_iter():
                 async with app.state.lock:
-                    voice = _resolve_voice_under_lock()
-                    registry.apply(voice)
+                    _prepare_voice()
                     stream_fn = (
                         inference.generate_stream_fast_async
                         if use_fast
@@ -299,13 +297,11 @@ def build_app(config: ServerConfig) -> FastAPI:
 
             return StreamingResponse(body_iter(), media_type=media_type)
 
-        # Blocking path — sentence_split is wrapper-level here.
         if req.sentence_split is not None:
             wrapper_kwargs["sentence_split"] = req.sentence_split
 
         async with app.state.lock:
-            voice = _resolve_voice_under_lock()
-            registry.apply(voice)
+            _prepare_voice()
 
             def _run():
                 if use_fast:
