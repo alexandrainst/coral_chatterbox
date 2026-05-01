@@ -339,6 +339,106 @@ wav1 = model.generate("First sentence.")
 wav2 = model.generate("Second sentence.")  # no re-encoding
 ```
 
+## Serving (OpenAI-compatible API)
+
+The repo ships an HTTP server that exposes an [OpenAI `audio.speech.create`-compatible](https://platform.openai.com/docs/api-reference/audio/createSpeech) endpoint. This is the recommended way to consume `coral_chatterbox` from environments where its tight dependency pins (`torch==2.7.1`, `transformers==4.46.3`, `numpy<2`) clash with the host project — instead of importing the package, talk to it over HTTP.
+
+### Run with Docker
+
+```bash
+docker build -t coral-chatterbox-server .
+
+docker run --gpus all -p 8000:8000 \
+  -v $PWD/voices:/voices \
+  -e VARIANT=multilingual \
+  -e DEFAULT_LANGUAGE=da \
+  -e REPO_ID=CoRal-project/roest-v3-chatterbox-500m \
+  -e HF_TOKEN=$HF_TOKEN \
+  coral-chatterbox-server
+```
+
+`./voices/` is a directory of reference WAV files. Each file becomes a named voice (e.g. `voices/anna.wav` → `voice="anna"`). At startup, conditioning embeddings are precomputed for every file in the directory so requests don't pay the encoding cost.
+
+### Run without Docker
+
+```bash
+uv sync --extra serve
+cd src && python -m server --variant multilingual --voices-dir ../voices --default-language da
+```
+
+All flags also bind to env vars: `--variant` ↔ `VARIANT`, `--voices-dir` ↔ `VOICES_DIR`, etc. See `python -m server --help`.
+
+### Calling the server
+
+With the official OpenAI SDK:
+
+```python
+from openai import OpenAI
+
+client = OpenAI(base_url="http://localhost:8000/v1", api_key="sk-anything")
+
+response = client.audio.speech.create(
+    model="coral-chatterbox",        # accepted but not used for routing
+    voice="anna",                    # name of a file under voices/
+    input="Hej verden.",
+    response_format="wav",           # "wav" or "pcm"
+    extra_body={"language": "da"},   # multilingual variant requires a language
+)
+response.write_to_file("out.wav")
+```
+
+Streaming (one HTTP chunk per sentence — first audio arrives well before synthesis completes):
+
+```python
+with client.audio.speech.with_streaming_response.create(
+    model="coral-chatterbox",
+    voice="anna",
+    input="Første sætning. Anden sætning. Tredje sætning.",
+    response_format="pcm",
+    extra_body={"language": "da", "stream_format": "audio"},
+) as r:
+    for chunk in r.iter_bytes():
+        play(chunk)  # 16-bit LE PCM at the model sample rate
+```
+
+`pcm` is the recommended format for streaming. `wav` streaming uses a max-size sentinel header that most decoders accept but some strict ones reject.
+
+### Per-request override and ad-hoc voice registration
+
+To synthesise with a one-off reference voice, pass base64-encoded WAV in `extra_body` — but this re-encodes per request:
+
+```python
+import base64
+ref = base64.b64encode(open("ref.wav", "rb").read()).decode()
+client.audio.speech.create(
+    model="coral-chatterbox", voice="ignored", input="...",
+    extra_body={"audio_prompt_b64": ref, "language": "da"},
+)
+```
+
+For repeated calls with the same custom voice, register it once and reference it by name:
+
+```python
+import requests
+requests.post("http://localhost:8000/v1/audio/voices",
+              json={"name": "tmp_anna", "audio_b64": ref})
+client.audio.speech.create(model="coral-chatterbox", voice="tmp_anna", input="...")
+```
+
+### Supported `extra_body` fields
+
+| Field | Effect |
+|---|---|
+| `language` | Per-request override of `default_language` (multilingual variant) |
+| `audio_prompt_b64` | One-off reference WAV (base64); takes precedence over `voice` |
+| `stream_format` | `"audio"` enables HTTP-chunked streaming on this request |
+| `exaggeration`, `temperature`, `top_p`, `cfg_weight`, `repetition_penalty`, `min_p`, `max_new_tokens` | Forwarded to the underlying model (kwargs unsupported by the variant are silently dropped) |
+| `normalize_text`, `sentence_split`, `inter_sentence_silence_ms` | Per-call overrides for text preprocessing |
+
+### Concurrency caveat
+
+The server runs a single uvicorn worker and serialises requests with an asyncio lock. `ChatterboxInference` is not thread-safe: speaker conditioning and CUDA-graph state live on the model instance. For higher throughput, run multiple replicas behind a load balancer.
+
 ## Repository Structure
 
 ```
@@ -365,6 +465,12 @@ src/
       upload_model.ipynb        # Upload complete model to HF
       upload_checkpoint.ipynb   # Upload checkpoint-assembled model to HF
       text_examples.txt         # Test prompts for checkpoint testing
+  server/                  # OpenAI-compatible HTTP server (this fork's addition)
+    __main__.py            # `python -m server` entry point
+    app.py                 # FastAPI app + endpoints
+    voices.py              # Voice registry with precomputed conditionals
+    audio.py               # Tensor → WAV / PCM byte encoders
+    config.py              # CLI / env-var driven server config
 ```
 
 ## Acknowledgements

@@ -1,0 +1,23 @@
+services:
+  tts:
+    build: .
+    image: coral-chatterbox-server
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./voices:/voices
+    environment:
+      VARIANT: ${VARIANT:-multilingual}
+      DEFAULT_LANGUAGE: ${DEFAULT_LANGUAGE:-en}
+      DEFAULT_VOICE: ${DEFAULT_VOICE:-}
+      REPO_ID: ${REPO_ID:-}
+      MODEL_DIR: ${MODEL_DIR:-}
+      API_KEY: ${API_KEY:-}
+      HF_TOKEN: ${HF_TOKEN:-}
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
