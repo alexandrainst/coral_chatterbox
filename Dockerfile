@@ -5,8 +5,9 @@ FROM pytorch/pytorch:2.7.1-cuda12.8-cudnn9-runtime
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
-    PIP_NO_CACHE_DIR=1 \
-    PIP_DISABLE_PIP_VERSION_CHECK=1
+    UV_LINK_MODE=copy \
+    UV_COMPILE_BYTECODE=1 \
+    UV_PROJECT_ENVIRONMENT=/opt/conda
 
 # System deps for librosa / soundfile and git-based installs (resemble-perth).
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -16,15 +17,17 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
+# uv: fast resolver/installer. Pinned by digest-equivalent tag.
+COPY --from=ghcr.io/astral-sh/uv:0.5.11 /uv /uvx /usr/local/bin/
+
 WORKDIR /app
 
-# Install the project + serve extra. Copy pyproject first to leverage layer
-# caching when only sources change.
+# Install into the base image's existing conda env (which already has the
+# pinned torch build) so we don't rebuild a venv from scratch.
 COPY pyproject.toml README.md LICENSE ./
 COPY src ./src
 
-RUN pip install --upgrade pip \
-    && pip install -e ".[serve]"
+RUN uv pip install --python /opt/conda/bin/python -e ".[serve]"
 
 # Pre-fetch NLTK punkt_tab so the first request doesn't try to download it.
 # (utils/splitter.py also calls nltk.download at import time, but baking the
