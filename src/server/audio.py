@@ -9,7 +9,6 @@ from __future__ import annotations
 import io
 import struct
 import wave
-from typing import AsyncIterator, Iterator
 
 import numpy as np
 import torch
@@ -65,25 +64,3 @@ def streaming_wav_header(sample_rate: int) -> bytes:
     header += b"data"
     header += struct.pack("<I", 0xFFFFFFFF)  # data chunk size
     return header
-
-
-def stream_pcm16(chunks: Iterator[torch.Tensor]) -> Iterator[bytes]:
-    for chunk in chunks:
-        yield encode_pcm16(chunk)
-
-
-def stream_wav(chunks: Iterator[torch.Tensor], sample_rate: int) -> Iterator[bytes]:
-    yield streaming_wav_header(sample_rate)
-    for chunk in chunks:
-        yield encode_pcm16(chunk)
-
-
-async def astream_pcm16(chunks: AsyncIterator[torch.Tensor]) -> AsyncIterator[bytes]:
-    async for chunk in chunks:
-        yield encode_pcm16(chunk)
-
-
-async def astream_wav(chunks: AsyncIterator[torch.Tensor], sample_rate: int) -> AsyncIterator[bytes]:
-    yield streaming_wav_header(sample_rate)
-    async for chunk in chunks:
-        yield encode_pcm16(chunk)

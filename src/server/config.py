@@ -3,7 +3,7 @@ from __future__ import annotations
 import argparse
 import os
 from dataclasses import dataclass
-from typing import Literal, Optional
+from typing import Literal
 
 VARIANTS = ("base", "multilingual", "turbo")
 
@@ -11,14 +11,14 @@ VARIANTS = ("base", "multilingual", "turbo")
 @dataclass
 class ServerConfig:
     variant: Literal["base", "multilingual", "turbo"] = "multilingual"
-    repo_id: Optional[str] = None
-    model_dir: Optional[str] = None
+    repo_id: str | None = None
+    model_dir: str | None = None
     voices_dir: str = "/voices"
-    default_voice: Optional[str] = None
+    default_voice: str | None = None
     default_language: str = "en"
-    device: Optional[str] = None
+    device: str | None = None
     fast: bool = True
-    api_key: Optional[str] = None
+    api_key: str | None = None
     host: str = "0.0.0.0"
     port: int = 8000
     model_id: str = "coral-chatterbox"

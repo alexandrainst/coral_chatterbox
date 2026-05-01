@@ -144,6 +144,11 @@ class ChatterboxInference:
         )
         return cls._load_model_from_local(model_type=model_type, ckpt_dir=ckpt_dir, device=device)
 
+    def invalidate_prompt_cache(self) -> None:
+        """Mark the speaker-conditioning cache as dirty so the next generate()
+        call with an audio_prompt_path re-runs prepare_conditionals."""
+        self._last_audio_prompt_path = None
+
     def prepare_conditionals(self, audio_prompt_path: str, **kwargs) -> None:
         """Pre-compute and cache speaker embeddings from a reference audio file.
 

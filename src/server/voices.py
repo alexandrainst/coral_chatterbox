@@ -13,11 +13,11 @@ import base64
 import binascii
 import copy
 import logging
+import os
 import tempfile
 import threading
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Optional
 
 from chatterbox.inference import ChatterboxInference
 
@@ -37,7 +37,7 @@ class Voice:
 class VoiceRegistry:
     def __init__(self, inference: ChatterboxInference):
         self.inference = inference
-        self._voices: Dict[str, Voice] = {}
+        self._voices: dict[str, Voice] = {}
         self._lock = threading.Lock()
 
     # --- registration ---
@@ -52,7 +52,7 @@ class VoiceRegistry:
         for wav in sorted(path.glob("*.wav")):
             name = wav.stem
             try:
-                self._register_from_path(name, str(wav))
+                self._register_named(name, str(wav))
                 loaded.append(name)
                 logger.info("Registered voice '%s' from %s", name, wav)
             except Exception:
@@ -60,33 +60,41 @@ class VoiceRegistry:
         return loaded
 
     def register_from_base64(self, name: str, audio_b64: str, **kwargs) -> Voice:
-        try:
-            blob = base64.b64decode(audio_b64, validate=True)
-        except (binascii.Error, ValueError) as exc:
-            raise VoiceError(f"audio_b64 is not valid base64: {exc}") from exc
-        with tempfile.NamedTemporaryFile(suffix=".wav", delete=True) as tmp:
-            tmp.write(blob)
-            tmp.flush()
-            return self._register_from_path(name, tmp.name, **kwargs)
+        """Decode base64, run prepare_conditionals, store under ``name``."""
+        with _b64_to_tempfile(audio_b64) as path:
+            return self._register_named(name, path, **kwargs)
 
-    def _register_from_path(self, name: str, path: str, **kwargs) -> Voice:
-        # ChatterboxInference.prepare_conditionals filters kwargs to what the
-        # underlying variant accepts (exaggeration, norm_loudness, ...).
-        self.inference.prepare_conditionals(path, **kwargs)
-        conds = self._snapshot_conds()
-        if conds is None:
-            raise VoiceError(f"prepare_conditionals produced no conds for '{name}'")
+    def register_transient(self, audio_b64: str, **kwargs) -> Voice:
+        """Like ``register_from_base64`` but does not retain the voice in the
+        registry — used for one-shot inline prompts where we don't want to
+        accumulate entries across requests."""
+        with _b64_to_tempfile(audio_b64) as path:
+            conds = self._compute_conds(path, **kwargs)
+        return Voice(name="<transient>", conds=conds)
+
+    def _register_named(self, name: str, path: str, **kwargs) -> Voice:
+        conds = self._compute_conds(path, **kwargs)
         voice = Voice(name=name, conds=conds)
         with self._lock:
             self._voices[name] = voice
-        # Reset the wrapper cache so the next request doesn't think a stale path
-        # is still loaded.
-        self.inference._last_audio_prompt_path = None
         return voice
+
+    def _compute_conds(self, path: str, **kwargs):
+        # ChatterboxInference.prepare_conditionals filters kwargs to what the
+        # underlying variant accepts (exaggeration, norm_loudness, ...).
+        self.inference.prepare_conditionals(path, **kwargs)
+        conds = getattr(self.inference.model, "conds", None)
+        if conds is None:
+            raise VoiceError(f"prepare_conditionals produced no conds for '{path}'")
+        snapshot = copy.deepcopy(conds)
+        # Reset the wrapper cache so the next request doesn't think a stale
+        # path is still loaded.
+        self.inference.invalidate_prompt_cache()
+        return snapshot
 
     # --- access ---
 
-    def get(self, name: str) -> Optional[Voice]:
+    def get(self, name: str) -> Voice | None:
         with self._lock:
             return self._voices.get(name)
 
@@ -111,18 +119,38 @@ class VoiceRegistry:
         marker so ``ChatterboxInference.generate`` does not re-encode.
         """
         self.inference.model.conds = voice.conds
+        # Sentinel string keeps the wrapper's cache check happy without
+        # pointing at a real path.
         self.inference._last_audio_prompt_path = f"<voice:{voice.name}>"
 
-    def _snapshot_conds(self):
-        """Deep-copy the current ``model.conds`` so subsequent calls don't mutate it."""
-        conds = getattr(self.inference.model, "conds", None)
-        if conds is None:
-            return None
+
+class _b64_to_tempfile:
+    """Context manager: decode base64 into a temp .wav, yield its path,
+    delete on exit. Portable across platforms (avoids the Windows
+    NamedTemporaryFile reopen restriction)."""
+
+    def __init__(self, audio_b64: str):
+        self.audio_b64 = audio_b64
+        self.path: str | None = None
+
+    def __enter__(self) -> str:
         try:
-            return copy.deepcopy(conds)
+            blob = base64.b64decode(self.audio_b64, validate=True)
+        except (binascii.Error, ValueError) as exc:
+            raise VoiceError(f"audio_b64 is not valid base64: {exc}") from exc
+        fd, path = tempfile.mkstemp(suffix=".wav")
+        try:
+            with os.fdopen(fd, "wb") as f:
+                f.write(blob)
         except Exception:
-            # Fall back to a shallow copy on the dataclass; tensors stay shared.
-            # This is rare — the Conditionals dataclasses contain tensors that
-            # deepcopy handles fine.
-            logger.exception("Deep-copy of conds failed; using the live object directly")
-            return conds
+            os.unlink(path)
+            raise
+        self.path = path
+        return path
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        if self.path is not None:
+            try:
+                os.unlink(self.path)
+            except OSError:
+                pass

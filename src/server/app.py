@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import time
-from typing import Any, Literal, Optional
+from contextlib import asynccontextmanager
+from typing import Any, Literal
 
 from fastapi import Depends, FastAPI, HTTPException
 from fastapi.responses import JSONResponse, Response, StreamingResponse
@@ -18,42 +18,50 @@ from server.voices import VoiceError, VoiceRegistry
 
 logger = logging.getLogger(__name__)
 
+# Roughly 12MB of decoded audio (base64 inflates by 4/3). Generous for
+# reference clips, tight enough to reject obvious abuse.
+MAX_AUDIO_B64_BYTES = 16 * 1024 * 1024
+
 
 # --- request schema ---
 
 
 class SpeechRequest(BaseModel):
     """OpenAI-compatible body. Unknown keys are accepted (the OpenAI SDK forwards
-    ``extra_body`` fields verbatim)."""
+    ``extra_body`` fields verbatim).
+
+    For streaming, prefer ``response_format=pcm`` — the streaming WAV header
+    uses a max-size sentinel that some strict decoders reject.
+    """
 
     model_config = ConfigDict(extra="allow")
 
-    model: str = Field(default="coral-chatterbox")
+    model: str | None = None
     input: str
-    voice: Optional[str] = None
+    voice: str | None = None
     response_format: Literal["wav", "pcm"] = "wav"
     speed: float = 1.0
-    stream_format: Optional[Literal["audio", "sse"]] = None  # OpenAI uses None|"audio"|"sse"
+    stream_format: Literal["audio", "sse"] | None = None  # OpenAI uses None|"audio"|"sse"
 
     # --- non-standard extras (forwarded via extra_body) ---
-    language: Optional[str] = None
-    audio_prompt_b64: Optional[str] = None
-    exaggeration: Optional[float] = None
-    temperature: Optional[float] = None
-    top_p: Optional[float] = None
-    cfg_weight: Optional[float] = None
-    repetition_penalty: Optional[float] = None
-    min_p: Optional[float] = None
-    max_new_tokens: Optional[int] = None
-    normalize_text: Optional[bool] = None
-    sentence_split: Optional[bool] = None
-    inter_sentence_silence_ms: Optional[int] = None
+    language: str | None = None
+    audio_prompt_b64: str | None = None
+    exaggeration: float | None = None
+    temperature: float | None = None
+    top_p: float | None = None
+    cfg_weight: float | None = None
+    repetition_penalty: float | None = None
+    min_p: float | None = None
+    max_new_tokens: int | None = None
+    normalize_text: bool | None = None
+    sentence_split: bool | None = None
+    inter_sentence_silence_ms: int | None = None
 
 
 class RegisterVoiceRequest(BaseModel):
     name: str
     audio_b64: str
-    exaggeration: Optional[float] = None
+    exaggeration: float | None = None
 
 
 # --- helpers ---
@@ -65,6 +73,14 @@ def _media_type_for(fmt: str, sample_rate: int) -> str:
     if fmt == "pcm":
         return f"audio/L16; rate={sample_rate}; channels=1"
     raise HTTPException(status_code=400, detail=f"Unsupported response_format: {fmt}")
+
+
+def _check_audio_b64_size(audio_b64: str) -> None:
+    if len(audio_b64) > MAX_AUDIO_B64_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail=f"audio_b64 exceeds {MAX_AUDIO_B64_BYTES} bytes",
+        )
 
 
 def _generation_kwargs(req: SpeechRequest) -> dict[str, Any]:
@@ -94,25 +110,12 @@ def _generation_kwargs(req: SpeechRequest) -> dict[str, Any]:
 
 
 def build_app(config: ServerConfig) -> FastAPI:
-    app = FastAPI(title="coral-chatterbox", version="0.1.0")
-    app.state.config = config
-    app.state.ready = False
-    app.state.inference = None
-    app.state.registry = None
-    app.state.lock = asyncio.Lock()
-
-    auth_scheme = HTTPBearer(auto_error=False)
-
-    def require_auth(creds: HTTPAuthorizationCredentials | None = Depends(auth_scheme)) -> None:
-        if not config.api_key:
-            return
-        if creds is None or creds.scheme.lower() != "bearer" or creds.credentials != config.api_key:
-            raise HTTPException(status_code=401, detail="invalid api key")
-
-    @app.on_event("startup")
-    def _load() -> None:
-        logger.info("Loading model variant=%s repo_id=%s model_dir=%s device=%s",
-                    config.variant, config.repo_id, config.model_dir, config.device)
+    @asynccontextmanager
+    async def lifespan(app: FastAPI):
+        logger.info(
+            "Loading model variant=%s repo_id=%s model_dir=%s device=%s",
+            config.variant, config.repo_id, config.model_dir, config.device,
+        )
         if config.model_dir:
             inference = ChatterboxInference.from_local(
                 ckpt_dir=config.model_dir,
@@ -131,15 +134,41 @@ def build_app(config: ServerConfig) -> FastAPI:
         loaded = registry.load_directory(config.voices_dir)
         logger.info("Loaded %d voices from %s: %s", len(loaded), config.voices_dir, loaded)
 
-        if config.default_voice and config.default_voice not in registry:
-            logger.warning("default_voice=%s not found in registry", config.default_voice)
-        elif not config.default_voice and loaded:
-            config.default_voice = loaded[0]
-            logger.info("Using '%s' as default voice", config.default_voice)
+        default_voice = config.default_voice
+        if default_voice and default_voice not in registry:
+            logger.warning("default_voice=%s not found in registry", default_voice)
+            default_voice = None
+        if not default_voice and loaded:
+            default_voice = loaded[0]
+            logger.info("Using '%s' as default voice", default_voice)
+
+        if config.api_key is None:
+            logger.warning("API_KEY not set — server is unauthenticated")
 
         app.state.inference = inference
         app.state.registry = registry
+        app.state.default_voice = default_voice
+        app.state.lock = asyncio.Lock()
         app.state.ready = True
+        try:
+            yield
+        finally:
+            app.state.ready = False
+
+    app = FastAPI(title="coral-chatterbox", version="0.1.0", lifespan=lifespan)
+    app.state.config = config
+    app.state.ready = False
+    app.state.inference = None
+    app.state.registry = None
+    app.state.default_voice = None
+
+    auth_scheme = HTTPBearer(auto_error=False)
+
+    def require_auth(creds: HTTPAuthorizationCredentials | None = Depends(auth_scheme)) -> None:
+        if not config.api_key:
+            return
+        if creds is None or creds.scheme.lower() != "bearer" or creds.credentials != config.api_key:
+            raise HTTPException(status_code=401, detail="invalid api key")
 
     # --- endpoints ---
 
@@ -152,13 +181,14 @@ def build_app(config: ServerConfig) -> FastAPI:
             "variant": config.variant,
             "device": getattr(app.state.inference.model, "device", "unknown"),
             "voices": app.state.registry.names(),
-            "default_voice": config.default_voice,
+            "default_voice": app.state.default_voice,
             "default_language": config.default_language,
             "fast": config.fast,
         })
 
     @app.get("/v1/models")
     def list_models(_: None = Depends(require_auth)) -> dict:
+        import time
         return {
             "object": "list",
             "data": [{
@@ -170,16 +200,22 @@ def build_app(config: ServerConfig) -> FastAPI:
         }
 
     @app.post("/v1/audio/voices")
-    def register_voice(body: RegisterVoiceRequest, _: None = Depends(require_auth)) -> dict:
+    async def register_voice(body: RegisterVoiceRequest, _: None = Depends(require_auth)) -> dict:
         if not app.state.ready:
             raise HTTPException(status_code=503, detail="server warming up")
-        kwargs = {}
+        _check_audio_b64_size(body.audio_b64)
+        kwargs: dict[str, Any] = {}
         if body.exaggeration is not None:
             kwargs["exaggeration"] = body.exaggeration
-        try:
-            voice = app.state.registry.register_from_base64(body.name, body.audio_b64, **kwargs)
-        except VoiceError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        # Hold the model lock: prepare_conditionals mutates inference.model.conds.
+        async with app.state.lock:
+            try:
+                voice = app.state.registry.register_from_base64(body.name, body.audio_b64, **kwargs)
+            except VoiceError as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
+            except Exception as exc:
+                logger.exception("register_from_base64 failed for '%s'", body.name)
+                raise HTTPException(status_code=400, detail="could not decode reference audio") from exc
         return {"id": voice.name, "expires_at": None}
 
     @app.post("/v1/audio/speech")
@@ -188,31 +224,30 @@ def build_app(config: ServerConfig) -> FastAPI:
             raise HTTPException(status_code=503, detail="server warming up")
         if not req.input.strip():
             raise HTTPException(status_code=400, detail="`input` must be non-empty")
+        if req.audio_prompt_b64 is not None:
+            _check_audio_b64_size(req.audio_prompt_b64)
+        if req.speed != 1.0:
+            logger.warning(
+                "speed=%s requested but ignored — Chatterbox has no time-stretch control",
+                req.speed,
+            )
 
         inference: ChatterboxInference = app.state.inference
         registry: VoiceRegistry = app.state.registry
 
-        # Resolve voice. audio_prompt_b64 takes precedence; falls through to
-        # library lookup; falls back to default_voice.
-        voice = None
-        if req.audio_prompt_b64:
-            try:
-                voice = registry.register_from_base64(
-                    name=f"_inline_{int(time.time() * 1000)}",
-                    audio_b64=req.audio_prompt_b64,
-                    **({"exaggeration": req.exaggeration} if req.exaggeration is not None else {}),
-                )
-            except VoiceError as exc:
-                raise HTTPException(status_code=400, detail=str(exc)) from exc
-        else:
-            name = req.voice or config.default_voice
+        # Resolve named voices outside the lock (read-only registry lookup).
+        # Inline base64 voices are computed under the lock since they mutate
+        # inference.model.conds via prepare_conditionals.
+        named_voice = None
+        if not req.audio_prompt_b64:
+            name = req.voice or app.state.default_voice
             if name is None:
                 raise HTTPException(
                     status_code=400,
                     detail="no voice specified and no default voice configured",
                 )
-            voice = registry.get(name)
-            if voice is None:
+            named_voice = registry.get(name)
+            if named_voice is None:
                 raise HTTPException(status_code=404, detail=f"unknown voice '{name}'")
 
         language = req.language or config.default_language
@@ -231,9 +266,26 @@ def build_app(config: ServerConfig) -> FastAPI:
         streaming = req.stream_format == "audio"
         use_fast = config.fast and hasattr(inference.model, "generate_fast")
 
+        def _resolve_voice_under_lock():
+            if named_voice is not None:
+                return named_voice
+            transient_kwargs: dict[str, Any] = {}
+            if req.exaggeration is not None:
+                transient_kwargs["exaggeration"] = req.exaggeration
+            try:
+                return registry.register_transient(req.audio_prompt_b64, **transient_kwargs)
+            except VoiceError as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
+            except Exception as exc:
+                logger.exception("register_transient failed for inline audio_prompt_b64")
+                raise HTTPException(
+                    status_code=400, detail="could not decode reference audio",
+                ) from exc
+
         if streaming:
             async def body_iter():
                 async with app.state.lock:
+                    voice = _resolve_voice_under_lock()
                     registry.apply(voice)
                     stream_fn = (
                         inference.generate_stream_fast_async
@@ -252,6 +304,7 @@ def build_app(config: ServerConfig) -> FastAPI:
             wrapper_kwargs["sentence_split"] = req.sentence_split
 
         async with app.state.lock:
+            voice = _resolve_voice_under_lock()
             registry.apply(voice)
 
             def _run():
