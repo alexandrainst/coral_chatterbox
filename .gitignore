@@ -48,6 +48,7 @@ checkpoints/
 # Ignore generated sample .wav files
 **/*.wav
 !src/finetune/voices/**/*.wav
+!voices/*.wav
 
 # Ignore wandb files
 **/wandb/
