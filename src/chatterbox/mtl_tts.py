@@ -371,6 +371,7 @@ class ChatterboxMultilingualTTS:
             speech_tokens = speech_tokens[0]
 
             speech_tokens = drop_invalid_tokens(speech_tokens)
+            speech_tokens = speech_tokens[speech_tokens < 6561]
             speech_tokens = speech_tokens.to(self.device)
 
             wav, _ = self.s3gen.inference(

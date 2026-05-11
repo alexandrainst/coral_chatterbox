@@ -44,7 +44,7 @@ class SpeechRequest(BaseModel):
     stream_format: Literal["audio", "sse"] | None = None  # OpenAI uses None|"audio"|"sse"
 
     # --- non-standard extras (forwarded via extra_body) ---
-    language: str | None = None
+    language: str | None = "da"
     audio_prompt_b64: str | None = None
     exaggeration: float | None = None
     temperature: float | None = None
@@ -53,9 +53,9 @@ class SpeechRequest(BaseModel):
     repetition_penalty: float | None = None
     min_p: float | None = None
     max_new_tokens: int | None = None
-    normalize_text: bool | None = None
-    sentence_split: bool | None = None
-    inter_sentence_silence_ms: int | None = None
+    normalize_text: bool | None = False
+    sentence_split: bool | None = False
+    inter_sentence_silence_ms: int | None = 100
 
 
 class RegisterVoiceRequest(BaseModel):

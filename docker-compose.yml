@@ -18,11 +18,11 @@ services:
       API_KEY: ${API_KEY:-}
       HF_TOKEN: ${HF_TOKEN:-}
       NNPACK_DISABLE: "1"
-    # Uncomment to enable GPU passthrough (requires NVIDIA Container Toolkit):
-    # deploy:
-    #   resources:
-    #     reservations:
-    #       devices:
-    #         - driver: nvidia
-    #           count: all
-    #           capabilities: [gpu]
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    # Requires NVIDIA Container Toolkit on the host.
